@@ -39,3 +39,29 @@ def test_parse_remove_all_flags():
     assert args.keep_temp is True
     assert args.output == "out.mp4"
     assert args.threshold == 25
+
+
+from unittest.mock import patch
+from pathlib import Path
+
+
+def test_remove_manual_region_e2e(sample_video, tmp_path):
+    """End-to-end test with mocked IOPaint — copies input frames as 'inpainted' output."""
+    output_path = str(tmp_path / "clean.mp4")
+
+    def fake_inpaint(input_dir, mask_path, output_dir, device="cpu"):
+        import shutil
+        for f in Path(input_dir).glob("*.png"):
+            shutil.copy(f, Path(output_dir) / f.name)
+
+    with patch("static_ghost.cli.run_inpaint", side_effect=fake_inpaint):
+        with patch("static_ghost.cli.check_iopaint"):
+            from static_ghost.cli import parse_args, cmd_remove
+            args = parse_args(["remove", str(sample_video), "--region", "10,10,50,50", "-o", output_path])
+            cmd_remove(args)
+
+    assert Path(output_path).exists()
+    from static_ghost.video_engine import probe
+    meta = probe(output_path)
+    assert meta["width"] == 320
+    assert meta["height"] == 240
