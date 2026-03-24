@@ -64,9 +64,9 @@ def extract_sample_frames(video_path: str, n: int, output_dir: str) -> list[str]
                 out_path,
             ],
             capture_output=True,
-            check=True,
         )
-        paths.append(out_path)
+        if os.path.isfile(out_path):
+            paths.append(out_path)
     return paths
 
 
