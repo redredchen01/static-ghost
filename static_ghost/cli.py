@@ -11,6 +11,7 @@ from static_ghost.video_engine import probe, extract_sample_frames, extract_all_
 from static_ghost.detector import Region, detect_static_regions, save_preview
 from static_ghost.mask_generator import create_mask
 from static_ghost.inpainter import run as run_inpaint, check_iopaint
+from static_ghost.fast_inpaint import fast_remove
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -148,18 +149,20 @@ def cmd_remove(args: argparse.Namespace) -> None:
         frame_count = extract_all_frames(args.video, frames_dir)
         print(f"Extracted {frame_count} frames.")
 
-        print("Running IOPaint LaMa inpainting (this may take a while)...")
+        print("Running IOPaint LaMa inpainting...")
         output_frames_dir = os.path.join(tmp_root, "output")
         os.makedirs(output_frames_dir, exist_ok=True)
         try:
-            run_inpaint(frames_dir, mask_path, output_frames_dir, device=args.device)
+            fast_remove(
+                frames_dir, output_frames_dir, regions,
+                dilation=args.dilation, device=args.device,
+            )
         except Exception as e:
             print(f"\nIOPaint failed: {e}", file=sys.stderr)
             print(f"Temp files preserved at: {tmp_root}", file=sys.stderr)
             print(f"Mask: {mask_path}", file=sys.stderr)
             args.keep_temp = True
             return
-        print("\nInpainting complete.")
 
         output_path = args.output or _default_output_path(args.video)
         print(f"Merging to {output_path}...")
