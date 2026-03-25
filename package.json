@@ -1,0 +1,26 @@
+{
+  "name": "static-ghost",
+  "version": "0.4.0",
+  "description": "Remove static watermarks from videos using LaMa inpainting. FFmpeg + IOPaint CLI pipeline with auto-detection, interactive picker, stream mode, and edge feathering.",
+  "keywords": [
+    "video",
+    "watermark",
+    "removal",
+    "inpainting",
+    "lama",
+    "ffmpeg",
+    "iopaint",
+    "cli"
+  ],
+  "author": "redredchen01",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/redredchen01/static-ghost.git"
+  },
+  "homepage": "https://github.com/redredchen01/static-ghost",
+  "files": [
+    "README.md",
+    "LICENSE"
+  ]
+}
