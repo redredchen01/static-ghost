@@ -3,7 +3,7 @@ from static_ghost.inpainter import run, check_iopaint
 
 
 def test_run_calls_iopaint_cli():
-    with patch("static_ghost.inpainter.subprocess.run") as mock_run:
+    with patch("static_ghost.fast_inpaint.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0)
         run("/tmp/input", "/tmp/mask.png", "/tmp/output", device="cpu")
         mock_run.assert_called_once()

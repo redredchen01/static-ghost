@@ -12,7 +12,7 @@ import os
 import threading
 import webbrowser
 
-import cv2
+import sys
 
 from static_ghost.detector import Region
 
@@ -104,8 +104,16 @@ def pick_region(frame_path: str, port: int = 18923) -> Region | None:
         def log_message(self, *args):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}"
+    for attempt_port in range(port, port + 10):
+        try:
+            server = http.server.HTTPServer(("127.0.0.1", attempt_port), Handler)
+            break
+        except OSError:
+            continue
+    else:
+        print("Error: Could not find an available port for picker.", file=sys.stderr)
+        return None
+    url = f"http://127.0.0.1:{attempt_port}"
     print(f"Opening region picker at {url}")
     webbrowser.open(url)
 

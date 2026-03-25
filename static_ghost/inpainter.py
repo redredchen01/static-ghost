@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
+
+from static_ghost.fast_inpaint import _run_iopaint
 
 
 def check_iopaint() -> None:
@@ -18,16 +19,5 @@ def run(
     output_dir: str,
     device: str = "cpu",
 ) -> None:
-    """Run IOPaint LaMa inpainting on a directory of frames.
-
-    NOTE: CLI flags validated against IOPaint v1.6.0.
-    """
-    cmd = [
-        "iopaint", "run",
-        "--model", "lama",
-        "--device", device,
-        "--image", input_dir,
-        "--mask", mask_path,
-        "--output", output_dir,
-    ]
-    subprocess.run(cmd, check=True)
+    """Run IOPaint LaMa inpainting on a directory of frames."""
+    _run_iopaint(input_dir, mask_path, output_dir, device)

@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cv2
-import numpy as np
-from PIL import Image, ImageDraw
+
+from static_ghost.fast_inpaint import _build_mask
 
 if TYPE_CHECKING:
     from static_ghost.detector import Region
@@ -18,17 +18,6 @@ def create_mask(
     dilation: int = 5,
 ) -> str:
     """Generate a black/white mask PNG. White = watermark regions (dilated)."""
-    mask = Image.new("L", (width, height), 0)
-    draw = ImageDraw.Draw(mask)
-
-    for r in regions:
-        draw.rectangle([r.x, r.y, r.x + r.w - 1, r.y + r.h - 1], fill=255)
-
-    if dilation > 0:
-        arr = np.array(mask)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilation * 2 + 1, dilation * 2 + 1))
-        arr = cv2.dilate(arr, kernel, iterations=1)
-        mask = Image.fromarray(arr)
-
-    mask.save(output_path)
+    mask = _build_mask(width, height, regions, 0, 0, dilation)
+    cv2.imwrite(output_path, mask)
     return output_path

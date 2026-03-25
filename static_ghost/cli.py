@@ -10,7 +10,7 @@ from pathlib import Path
 from static_ghost.video_engine import probe, extract_sample_frames, extract_all_frames, merge
 from static_ghost.detector import Region, detect_static_regions, save_preview
 from static_ghost.mask_generator import create_mask
-from static_ghost.inpainter import run as run_inpaint, check_iopaint
+from static_ghost.inpainter import check_iopaint
 from static_ghost.fast_inpaint import fast_remove, fast_remove_streamed
 
 
@@ -73,8 +73,11 @@ def _warn_disk_space(video_path: str, meta: dict) -> None:
     avg_frame_bytes = meta["width"] * meta["height"] * 3
     estimated_bytes = frame_count * avg_frame_bytes * 2
 
-    stat = os.statvfs(os.path.dirname(os.path.abspath(video_path)))
-    available = stat.f_bavail * stat.f_frsize
+    try:
+        usage = shutil.disk_usage(os.path.dirname(os.path.abspath(video_path)))
+        available = usage.free
+    except OSError:
+        return
 
     if estimated_bytes > available:
         est_gb = estimated_bytes / (1024**3)

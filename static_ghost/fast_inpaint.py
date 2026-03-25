@@ -74,7 +74,7 @@ def fast_remove(
     _run_iopaint(crops_dir, mask_path, crops_out_dir, device)
 
     # Step 3: Paste back — pre-build crop path lookup
-    crop_lookup = _build_crop_lookup(crops_out_dir, frame_files)
+    crop_lookup = _build_crop_lookup(crops_out_dir)
 
     print(f"Compositing {len(frame_files)} frames with edge blending...")
     for fname in frame_files:
@@ -144,10 +144,7 @@ def fast_remove_streamed(
     _run_iopaint(crops_dir, mask_path, crops_out_dir, device)
 
     # Pre-build crop path lookup for Pass 2
-    crop_lookup = {}
-    for f in os.listdir(crops_out_dir):
-        stem = os.path.splitext(f)[0]
-        crop_lookup[stem] = os.path.join(crops_out_dir, f)
+    crop_lookup = _build_crop_lookup(crops_out_dir)
 
     # Pass 2: Decode video again → paste inpainted crops → encode output
     print("Pass 2: Compositing and encoding...")
@@ -174,7 +171,7 @@ def _run_iopaint(image_dir: str, mask_path: str, output_dir: str, device: str) -
         raise RuntimeError(f"IOPaint failed (exit {result.returncode}): {result.stderr[:500]}")
 
 
-def _build_crop_lookup(crops_out_dir: str, frame_files: list[str]) -> dict[str, str]:
+def _build_crop_lookup(crops_out_dir: str) -> dict[str, str]:
     """Pre-build stem → path mapping for inpainted crops."""
     lookup = {}
     for f in os.listdir(crops_out_dir):
@@ -219,6 +216,8 @@ def _extract_crops(
     finally:
         proc.stdout.close()
         proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg decoder exited with code {proc.returncode}")
     return idx
 
 
@@ -289,6 +288,9 @@ def _paste_and_encode(
         encoder.stdin.close()
         encoder.wait()
 
+    if encoder.returncode != 0:
+        raise RuntimeError(f"FFmpeg encoder exited with code {encoder.returncode}")
+
     # Mux: add original audio
     subprocess.run(
         [
@@ -311,14 +313,14 @@ def _build_mask(
     crop_w: int, crop_h: int,
     regions: list[Region], offset_x: int, offset_y: int, dilation: int,
 ) -> np.ndarray:
-    """Build binary mask for the crop region."""
+    """Build binary mask for the crop region. Dilation applied once via morphology."""
     mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
     for r in regions:
         rx, ry = r.x - offset_x, r.y - offset_y
-        x1 = max(0, rx - dilation)
-        y1 = max(0, ry - dilation)
-        x2 = min(crop_w, rx + r.w + dilation)
-        y2 = min(crop_h, ry + r.h + dilation)
+        x1 = max(0, rx)
+        y1 = max(0, ry)
+        x2 = min(crop_w, rx + r.w)
+        y2 = min(crop_h, ry + r.h)
         mask[y1:y2, x1:x2] = 255
     if dilation > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilation * 2 + 1, dilation * 2 + 1))
