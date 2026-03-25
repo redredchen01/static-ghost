@@ -11,7 +11,7 @@ from static_ghost.video_engine import probe, extract_sample_frames, extract_all_
 from static_ghost.detector import Region, detect_static_regions, save_preview
 from static_ghost.mask_generator import create_mask
 from static_ghost.inpainter import run as run_inpaint, check_iopaint
-from static_ghost.fast_inpaint import fast_remove
+from static_ghost.fast_inpaint import fast_remove, fast_remove_streamed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -28,6 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     rm.add_argument("--device", default="cpu", choices=["cpu", "mps"], help="Compute device")
     rm.add_argument("--dilation", type=int, default=5, help="Mask dilation pixels (default: 5)")
     rm.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
+    rm.add_argument("--stream", action="store_true", help="Stream mode: ~95%% less disk usage (no full-frame extraction)")
     rm.add_argument("-o", "--output", help="Output video path")
 
     sub.add_parser("detect", parents=[parent], help="Detect watermarks only (no removal)")
@@ -177,39 +178,54 @@ def cmd_remove(args: argparse.Namespace) -> None:
             if not regions:
                 return
 
-        print("Generating mask...")
-        mask_path = os.path.join(tmp_root, "mask.png")
-        create_mask(meta["width"], meta["height"], regions, mask_path, dilation=args.dilation)
-
-        print("Extracting all frames (this may take a moment)...")
-        frames_dir = os.path.join(tmp_root, "frames")
-        frame_count = extract_all_frames(args.video, frames_dir)
-        print(f"Extracted {frame_count} frames.")
-
-        print("Running IOPaint LaMa inpainting...")
-        output_frames_dir = os.path.join(tmp_root, "output")
-        os.makedirs(output_frames_dir, exist_ok=True)
-        try:
-            fast_remove(
-                frames_dir, output_frames_dir, regions,
-                dilation=args.dilation, device=args.device,
-            )
-        except Exception as e:
-            print(f"\nIOPaint failed: {e}", file=sys.stderr)
-            print(f"Temp files preserved at: {tmp_root}", file=sys.stderr)
-            print(f"Mask: {mask_path}", file=sys.stderr)
-            args.keep_temp = True
-            return
-
         output_path = args.output or _default_output_path(args.video)
-        print(f"Merging to {output_path}...")
-        try:
-            merge(output_frames_dir, args.video, output_path)
-        except Exception as e:
-            print(f"\nFFmpeg merge failed: {e}", file=sys.stderr)
-            print(f"Inpainted frames at: {output_frames_dir}", file=sys.stderr)
-            args.keep_temp = True
-            return
+
+        if getattr(args, "stream", False):
+            # Stream mode: no full-frame extraction, ~95% less disk
+            print(f"Stream mode: processing directly to {output_path}...")
+            try:
+                fast_remove_streamed(
+                    args.video, output_path, regions,
+                    dilation=args.dilation, device=args.device,
+                )
+            except Exception as e:
+                print(f"\nProcessing failed: {e}", file=sys.stderr)
+                args.keep_temp = True
+                return
+        else:
+            # Classic mode: extract all frames to disk
+            print("Generating mask...")
+            mask_path = os.path.join(tmp_root, "mask.png")
+            create_mask(meta["width"], meta["height"], regions, mask_path, dilation=args.dilation)
+
+            print("Extracting all frames (this may take a moment)...")
+            frames_dir = os.path.join(tmp_root, "frames")
+            frame_count = extract_all_frames(args.video, frames_dir)
+            print(f"Extracted {frame_count} frames.")
+
+            print("Running IOPaint LaMa inpainting...")
+            output_frames_dir = os.path.join(tmp_root, "output")
+            os.makedirs(output_frames_dir, exist_ok=True)
+            try:
+                fast_remove(
+                    frames_dir, output_frames_dir, regions,
+                    dilation=args.dilation, device=args.device,
+                )
+            except Exception as e:
+                print(f"\nIOPaint failed: {e}", file=sys.stderr)
+                print(f"Temp files preserved at: {tmp_root}", file=sys.stderr)
+                args.keep_temp = True
+                return
+
+            print(f"Merging to {output_path}...")
+            try:
+                merge(output_frames_dir, args.video, output_path)
+            except Exception as e:
+                print(f"\nFFmpeg merge failed: {e}", file=sys.stderr)
+                print(f"Inpainted frames at: {output_frames_dir}", file=sys.stderr)
+                args.keep_temp = True
+                return
+
         print(f"Done! Output: {output_path}")
 
     except Exception as e:
