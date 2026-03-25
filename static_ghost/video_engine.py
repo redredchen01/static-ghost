@@ -88,10 +88,16 @@ def extract_all_frames(video_path: str, output_dir: str) -> int:
 
 
 def merge(frames_dir: str, video_path: str, output_path: str) -> str:
-    """Merge PNG frames + original audio into output video."""
+    """Merge image frames + original audio into output video."""
     meta = probe(video_path)
     fps = meta["fps"]
-    pattern = os.path.join(frames_dir, "frame_%06d.png")
+
+    # Auto-detect frame format (PNG or JPEG)
+    sample_files = os.listdir(frames_dir)
+    if any(f.endswith(".png") for f in sample_files):
+        pattern = os.path.join(frames_dir, "frame_%06d.png")
+    else:
+        pattern = os.path.join(frames_dir, "frame_%06d.jpg")
 
     cmd = [
         "ffmpeg", "-y",

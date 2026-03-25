@@ -46,15 +46,16 @@ from pathlib import Path
 
 
 def test_remove_manual_region_e2e(sample_video, tmp_path):
-    """End-to-end test with mocked IOPaint — copies input frames as 'inpainted' output."""
+    """End-to-end test with mocked fast_remove — copies input frames as 'inpainted' output."""
     output_path = str(tmp_path / "clean.mp4")
 
-    def fake_inpaint(input_dir, mask_path, output_dir, device="cpu"):
-        import shutil
-        for f in Path(input_dir).glob("*.png"):
+    def fake_fast_remove(frames_dir, output_dir, regions, dilation, device="cpu", padding=50):
+        import shutil, os
+        os.makedirs(output_dir, exist_ok=True)
+        for f in Path(frames_dir).glob("*.png"):
             shutil.copy(f, Path(output_dir) / f.name)
 
-    with patch("static_ghost.cli.run_inpaint", side_effect=fake_inpaint):
+    with patch("static_ghost.cli.fast_remove", side_effect=fake_fast_remove):
         with patch("static_ghost.cli.check_iopaint"):
             from static_ghost.cli import parse_args, cmd_remove
             args = parse_args(["remove", str(sample_video), "--region", "10,10,50,50", "-o", output_path])

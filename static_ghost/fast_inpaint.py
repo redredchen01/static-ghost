@@ -1,24 +1,45 @@
 """Fast inpainting: crop watermark region, inpaint small patch, paste back.
 
-Instead of running IOPaint on full 1920x1080 frames, we:
-1. Crop a small region around the watermark (with padding)
-2. Create a mask for just that crop
-3. Run IOPaint on the tiny crops
-4. Paste inpainted crops back onto original frames
-
-This is 5-10x faster than full-frame processing.
+Optimizations over naive full-frame approach:
+1. Crop-and-paste: only inpaint the watermark region (~15x fewer pixels)
+2. JPEG temp files: 3-5x faster I/O vs PNG, ~5x smaller files
+3. Multiprocess crop/paste: parallelize CPU-bound image operations
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
+import tempfile
+from multiprocessing import Pool, cpu_count
 
 import cv2
 import numpy as np
 
 from static_ghost.detector import Region
+
+# JPEG quality for temp crops (95 = visually lossless, much faster than PNG)
+_JPEG_QUALITY = 95
+
+
+def _crop_one(args: tuple) -> None:
+    """Crop a single frame to the watermark region. (picklable for multiprocessing)"""
+    src_path, dst_path, min_x, min_y, max_x, max_y = args
+    frame = cv2.imread(src_path)
+    crop = frame[min_y:max_y, min_x:max_x]
+    cv2.imwrite(dst_path, crop, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+
+
+def _paste_one(args: tuple) -> None:
+    """Paste inpainted crop back onto original frame. Output as PNG (for FFmpeg merge)."""
+    orig_path, crop_path, dst_path, min_x, min_y, max_x, max_y = args
+    original = cv2.imread(orig_path)
+    inpainted_crop = cv2.imread(crop_path)
+    if inpainted_crop is None:
+        shutil.copy(orig_path, dst_path)
+        return
+    original[min_y:max_y, min_x:max_x] = inpainted_crop
+    cv2.imwrite(dst_path, original)
 
 
 def fast_remove(
@@ -36,11 +57,9 @@ def fast_remove(
     if not frame_files:
         raise ValueError(f"No PNG frames found in {frames_dir}")
 
-    # Read first frame to get dimensions
     sample = cv2.imread(os.path.join(frames_dir, frame_files[0]))
     fh, fw = sample.shape[:2]
 
-    # Compute bounding box that covers ALL regions + dilation + padding
     min_x = max(0, min(r.x for r in regions) - dilation - padding)
     min_y = max(0, min(r.y for r in regions) - dilation - padding)
     max_x = min(fw, max(r.x + r.w for r in regions) + dilation + padding)
@@ -51,8 +70,6 @@ def fast_remove(
     print(f"Crop region: ({min_x},{min_y}) {crop_w}x{crop_h} (full frame: {fw}x{fh})")
     print(f"Speedup: ~{(fw*fh)/(crop_w*crop_h):.1f}x fewer pixels per frame")
 
-    # Create temp dirs for crops
-    import tempfile
     tmp = tempfile.mkdtemp(prefix="sg_fast_")
     crops_dir = os.path.join(tmp, "crops")
     crops_out_dir = os.path.join(tmp, "crops_out")
@@ -62,16 +79,13 @@ def fast_remove(
     # Create crop-sized mask
     mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
     for r in regions:
-        rx = r.x - min_x
-        ry = r.y - min_y
-        # Draw rectangle with dilation
+        rx, ry = r.x - min_x, r.y - min_y
         x1 = max(0, rx - dilation)
         y1 = max(0, ry - dilation)
         x2 = min(crop_w, rx + r.w + dilation)
         y2 = min(crop_h, ry + r.h + dilation)
         mask[y1:y2, x1:x2] = 255
 
-    # Extra dilation with kernel for smooth edges
     if dilation > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilation * 2 + 1, dilation * 2 + 1))
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -79,14 +93,21 @@ def fast_remove(
     mask_path = os.path.join(tmp, "crop_mask.png")
     cv2.imwrite(mask_path, mask)
 
-    # Step 1: Crop all frames
-    print(f"Cropping {len(frame_files)} frames...")
-    for fname in frame_files:
-        frame = cv2.imread(os.path.join(frames_dir, fname))
-        crop = frame[min_y:max_y, min_x:max_x]
-        cv2.imwrite(os.path.join(crops_dir, fname), crop)
+    # Step 1: Parallel crop
+    nproc = min(cpu_count(), 8)
+    print(f"Cropping {len(frame_files)} frames ({nproc} workers)...")
+    crop_args = [
+        (
+            os.path.join(frames_dir, fname),
+            os.path.join(crops_dir, os.path.splitext(fname)[0] + ".jpg"),
+            min_x, min_y, max_x, max_y,
+        )
+        for fname in frame_files
+    ]
+    with Pool(nproc) as pool:
+        pool.map(_crop_one, crop_args)
 
-    # Step 2: Run IOPaint on crops
+    # Step 2: IOPaint on crops
     print("Running IOPaint on cropped regions...")
     cmd = [
         "iopaint", "run",
@@ -98,18 +119,23 @@ def fast_remove(
     ]
     subprocess.run(cmd, check=True)
 
-    # Step 3: Paste back
-    print("Compositing inpainted regions back...")
+    # Step 3: Parallel paste-back
+    print(f"Compositing {len(frame_files)} frames ({nproc} workers)...")
+    paste_args = []
     for fname in frame_files:
-        original = cv2.imread(os.path.join(frames_dir, fname))
-        inpainted_crop = cv2.imread(os.path.join(crops_out_dir, fname))
-        if inpainted_crop is None:
-            # Fallback: copy original
-            shutil.copy(os.path.join(frames_dir, fname), os.path.join(output_dir, fname))
-            continue
-        original[min_y:max_y, min_x:max_x] = inpainted_crop
-        cv2.imwrite(os.path.join(output_dir, fname), original)
+        crop_stem = os.path.splitext(fname)[0]
+        # IOPaint output may be .jpg or .png depending on input extension
+        crop_out = os.path.join(crops_out_dir, crop_stem + ".jpg")
+        if not os.path.exists(crop_out):
+            crop_out = os.path.join(crops_out_dir, crop_stem + ".png")
+        paste_args.append((
+            os.path.join(frames_dir, fname),
+            crop_out,
+            os.path.join(output_dir, fname),
+            min_x, min_y, max_x, max_y,
+        ))
+    with Pool(nproc) as pool:
+        pool.map(_paste_one, paste_args)
 
-    # Cleanup
     shutil.rmtree(tmp, ignore_errors=True)
     print("Fast inpainting complete.")
