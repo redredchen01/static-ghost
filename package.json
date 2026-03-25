@@ -1,6 +1,6 @@
 {
   "name": "static-ghost",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Remove static watermarks from videos using LaMa inpainting. FFmpeg + IOPaint CLI pipeline with auto-detection, interactive picker, stream mode, and edge feathering.",
   "keywords": [
     "video",
