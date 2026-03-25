@@ -25,6 +25,18 @@ def test_parse_detect():
     assert args.command == "detect"
 
 
+def test_parse_pick():
+    args = parse_args(["pick", "video.mp4", "--dilation", "15", "--device", "mps"])
+    assert args.command == "pick"
+    assert args.dilation == 15
+    assert args.device == "mps"
+
+
+def test_parse_remove_pick_flag():
+    args = parse_args(["remove", "video.mp4", "--pick"])
+    assert args.pick is True
+
+
 def test_parse_remove_all_flags():
     args = parse_args([
         "remove", "video.mp4",

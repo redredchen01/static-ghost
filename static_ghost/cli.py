@@ -24,12 +24,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     rm = sub.add_parser("remove", parents=[parent], help="Detect and remove watermarks")
     rm.add_argument("--region", action="append", default=[], help="Manual region x,y,w,h (repeatable)")
+    rm.add_argument("--pick", action="store_true", help="Open browser to draw watermark region")
     rm.add_argument("--device", default="cpu", choices=["cpu", "mps"], help="Compute device")
     rm.add_argument("--dilation", type=int, default=5, help="Mask dilation pixels (default: 5)")
     rm.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
     rm.add_argument("-o", "--output", help="Output video path")
 
     sub.add_parser("detect", parents=[parent], help="Detect watermarks only (no removal)")
+
+    pick = sub.add_parser("pick", parents=[parent], help="Open browser to draw watermark region")
+    pick.add_argument("--device", default="cpu", choices=["cpu", "mps"])
+    pick.add_argument("--dilation", type=int, default=5)
+    pick.add_argument("--keep-temp", action="store_true")
+    pick.add_argument("-o", "--output", help="Output video path")
 
     return parser.parse_args(argv)
 
@@ -74,6 +81,58 @@ def _warn_disk_space(video_path: str, meta: dict) -> None:
         print(f"Warning: Estimated disk usage {est_gb:.1f} GB, available {avail_gb:.1f} GB", file=sys.stderr)
 
 
+def _get_regions_interactive(video_path: str, tmp_root: str, threshold: int, use_picker: bool) -> list[Region] | None:
+    """Get watermark regions via auto-detect, picker, or user confirmation."""
+    if use_picker:
+        from static_ghost.picker import pick_region
+        print("Extracting a sample frame...")
+        samples_dir = os.path.join(tmp_root, "samples")
+        sample_paths = extract_sample_frames(video_path, n=1, output_dir=samples_dir)
+        if not sample_paths:
+            print("Error: Could not extract sample frame.", file=sys.stderr)
+            return None
+        region = pick_region(sample_paths[0])
+        if region:
+            print(f"Selected: x={region.x}, y={region.y}, w={region.w}, h={region.h}")
+            return [region]
+        print("No region selected.")
+        return None
+
+    # Auto-detect
+    print("Extracting sample frames for detection...")
+    samples_dir = os.path.join(tmp_root, "samples")
+    sample_paths = extract_sample_frames(video_path, n=30, output_dir=samples_dir)
+
+    regions = detect_static_regions(sample_paths, threshold=threshold)
+    if not regions:
+        print("No static watermark regions detected.")
+        print("Try: --threshold 25-50, or use --pick to draw the region, or --region x,y,w,h")
+        return None
+
+    print(f"\nDetected {len(regions)} region(s):")
+    for i, r in enumerate(regions):
+        print(f"  #{i+1}: x={r.x}, y={r.y}, w={r.w}, h={r.h} (confidence={r.confidence:.2f})")
+
+    preview_path = os.path.join(tmp_root, "preview.png")
+    mid = sample_paths[len(sample_paths) // 2]
+    save_preview(mid, regions, preview_path)
+    print(f"\nPreview: {preview_path}")
+    print("Open with: open " + preview_path)
+
+    answer = input("\nProceed with these regions? [Y/n/edit/pick] ").strip().lower()
+    if answer == "n":
+        return None
+    elif answer == "edit":
+        region_str = input("Enter regions as x,y,w,h (semicolon-separated): ").strip()
+        return [_parse_region(r.strip()) for r in region_str.split(";")]
+    elif answer == "pick":
+        from static_ghost.picker import pick_region
+        region = pick_region(sample_paths[len(sample_paths) // 2])
+        return [region] if region else None
+
+    return regions
+
+
 def cmd_detect(args: argparse.Namespace) -> None:
     _preflight(args.video)
 
@@ -87,7 +146,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
         if not regions:
             print("No static watermark regions detected.")
-            print("Try: --threshold 20-30 for semi-transparent watermarks, or use --region x,y,w,h manually.")
+            print("Try: --threshold 25-50, or use 'static-ghost pick' to draw the region.")
             return
 
         print(f"\nDetected {len(regions)} region(s):")
@@ -108,37 +167,15 @@ def cmd_remove(args: argparse.Namespace) -> None:
     tmp_root = tempfile.mkdtemp(prefix="static_ghost_")
 
     try:
+        # Get regions
         if args.region:
             regions = [_parse_region(r) for r in args.region]
             print(f"Using {len(regions)} manual region(s).")
         else:
-            print("Extracting sample frames for detection...")
-            samples_dir = os.path.join(tmp_root, "samples")
-            sample_paths = extract_sample_frames(args.video, n=30, output_dir=samples_dir)
-
-            regions = detect_static_regions(sample_paths, threshold=args.threshold)
+            use_picker = getattr(args, "pick", False)
+            regions = _get_regions_interactive(args.video, tmp_root, args.threshold, use_picker)
             if not regions:
-                print("No static watermark regions detected.")
-                print("Use --region x,y,w,h to specify manually.")
                 return
-
-            print(f"\nDetected {len(regions)} region(s):")
-            for i, r in enumerate(regions):
-                print(f"  #{i+1}: x={r.x}, y={r.y}, w={r.w}, h={r.h} (confidence={r.confidence:.2f})")
-
-            preview_path = os.path.join(tmp_root, "preview.png")
-            mid = sample_paths[len(sample_paths) // 2]
-            save_preview(mid, regions, preview_path)
-            print(f"\nPreview: {preview_path}")
-            print("Open with: open " + preview_path)
-
-            answer = input("\nProceed with these regions? [Y/n/edit] ").strip().lower()
-            if answer == "n":
-                print("Aborted.")
-                return
-            elif answer == "edit":
-                region_str = input("Enter regions as x,y,w,h (semicolon-separated): ").strip()
-                regions = [_parse_region(r.strip()) for r in region_str.split(";")]
 
         print("Generating mask...")
         mask_path = os.path.join(tmp_root, "mask.png")
@@ -171,7 +208,6 @@ def cmd_remove(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"\nFFmpeg merge failed: {e}", file=sys.stderr)
             print(f"Inpainted frames at: {output_frames_dir}", file=sys.stderr)
-            print(f"Manual merge: ffmpeg -framerate {meta['fps']} -i {output_frames_dir}/frame_%06d.png -i {args.video} -map 0:v -map 1:a? -c:v libx264 -pix_fmt yuv420p -c:a copy {output_path}", file=sys.stderr)
             args.keep_temp = True
             return
         print(f"Done! Output: {output_path}")
@@ -187,6 +223,13 @@ def cmd_remove(args: argparse.Namespace) -> None:
             print(f"Temp files kept at: {tmp_root}")
 
 
+def cmd_pick(args: argparse.Namespace) -> None:
+    """Pick region interactively then run removal."""
+    args.region = []
+    args.pick = True
+    cmd_remove(args)
+
+
 def _default_output_path(video_path: str) -> str:
     p = Path(video_path)
     return str(p.with_stem(p.stem + "_clean"))
@@ -198,3 +241,5 @@ def main() -> None:
         cmd_detect(args)
     elif args.command == "remove":
         cmd_remove(args)
+    elif args.command == "pick":
+        cmd_pick(args)
