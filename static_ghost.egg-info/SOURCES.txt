@@ -1,8 +1,0 @@
-pyproject.toml
-static_ghost/__init__.py
-static_ghost.egg-info/PKG-INFO
-static_ghost.egg-info/SOURCES.txt
-static_ghost.egg-info/dependency_links.txt
-static_ghost.egg-info/entry_points.txt
-static_ghost.egg-info/requires.txt
-static_ghost.egg-info/top_level.txt

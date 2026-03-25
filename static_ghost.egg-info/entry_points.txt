@@ -1,2 +1,0 @@
-[console_scripts]
-static-ghost = static_ghost.cli:main
