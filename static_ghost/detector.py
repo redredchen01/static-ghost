@@ -38,24 +38,36 @@ def detect_static_regions(
 
     rng = np.random.default_rng(0)
     n = len(frames_gray)
-    num_pairs = min(num_pairs, n * (n - 1) // 2)
+    max_possible = n * (n - 1) // 2
+    num_pairs = min(num_pairs, max_possible)
 
-    all_pairs = set()
-    while len(all_pairs) < num_pairs:
-        i, j = sorted(rng.choice(n, 2, replace=False))
-        all_pairs.add((i, j))
+    # Generate unique pairs efficiently
+    if num_pairs >= max_possible * 0.5:
+        # If we need most pairs, enumerate all and sample
+        all_possible = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        indices = rng.choice(len(all_possible), size=num_pairs, replace=False)
+        pairs = [all_possible[k] for k in indices]
+    else:
+        pairs_set: set[tuple[int, int]] = set()
+        while len(pairs_set) < num_pairs:
+            batch = rng.choice(n, size=(num_pairs * 2, 2), replace=True)
+            for row in batch:
+                if row[0] != row[1]:
+                    pairs_set.add((min(row[0], row[1]), max(row[0], row[1])))
+                if len(pairs_set) >= num_pairs:
+                    break
+        pairs = list(pairs_set)[:num_pairs]
 
     static_counts = np.zeros((h, w), dtype=np.int32)
-    total_pairs = len(all_pairs)
+    total_pairs = len(pairs)
 
-    for i, j in all_pairs:
+    for i, j in pairs:
         diff = cv2.absdiff(frames_gray[i], frames_gray[j])
-        static_mask = (diff < threshold).astype(np.uint8)
-        static_counts += static_mask
+        static_counts += (diff < threshold).view(np.uint8)
 
     # Majority vote: pixel is static if it passed in >= quorum of pairs
     min_votes = int(total_pairs * quorum)
-    global_static = (static_counts >= min_votes).astype(np.uint8) * 255
+    global_static = (static_counts >= min_votes).view(np.uint8) * 255
 
     # Morphological cleanup: close small gaps, remove noise
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -74,11 +86,13 @@ def detect_static_regions(
         if area / total_area > max_area_ratio:
             continue
         bx, by, bw, bh = cv2.boundingRect(cnt)
-        # Confidence = fraction of pairs that agreed this region is static
-        roi_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(roi_mask, [cnt], -1, 255, -1)
+        # Use bounding rect ROI instead of full-frame mask for confidence calc
+        roi = static_counts[by:by + bh, bx:bx + bw]
+        roi_mask = np.zeros((bh, bw), dtype=np.uint8)
+        shifted_cnt = cnt - np.array([bx, by])
+        cv2.drawContours(roi_mask, [shifted_cnt], -1, 255, -1)
         roi_pixels = roi_mask > 0
-        avg_votes = static_counts[roi_pixels].mean() if roi_pixels.any() else 0
+        avg_votes = roi[roi_pixels].mean() if roi_pixels.any() else 0
         confidence = round(avg_votes / total_pairs, 2)
         regions.append(Region(x=bx, y=by, w=bw, h=bh, confidence=confidence))
 

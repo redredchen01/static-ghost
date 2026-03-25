@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import struct
 import subprocess
 import tempfile
 
@@ -56,13 +55,11 @@ def fast_remove(
     os.makedirs(crops_dir)
     os.makedirs(crops_out_dir)
 
-    # Build mask with feathered edges
     mask = _build_mask(crop_w, crop_h, regions, min_x, min_y, dilation)
     mask_path = os.path.join(tmp, "crop_mask.png")
     cv2.imwrite(mask_path, mask)
 
-    # Build feather blend mask for paste-back (soft edges)
-    feather_mask = _build_feather_mask(crop_w, crop_h, feather_px=8)
+    feather_alpha, feather_inv = _build_feather_masks(crop_w, crop_h, feather_px=8)
 
     # Step 1: Crop all frames
     print(f"Cropping {len(frame_files)} frames...")
@@ -74,31 +71,21 @@ def fast_remove(
 
     # Step 2: IOPaint on crops
     print("Running IOPaint on cropped regions...")
-    cmd = [
-        "iopaint", "run",
-        "--model", "lama",
-        "--device", device,
-        "--image", crops_dir,
-        "--mask", mask_path,
-        "--output", crops_out_dir,
-    ]
-    subprocess.run(cmd, check=True)
+    _run_iopaint(crops_dir, mask_path, crops_out_dir, device)
 
-    # Step 3: Paste back with feathered blending
+    # Step 3: Paste back — pre-build crop path lookup
+    crop_lookup = _build_crop_lookup(crops_out_dir, frame_files)
+
     print(f"Compositing {len(frame_files)} frames with edge blending...")
     for fname in frame_files:
         original = cv2.imread(os.path.join(frames_dir, fname))
         crop_stem = os.path.splitext(fname)[0]
-        crop_out = os.path.join(crops_out_dir, crop_stem + ".jpg")
-        if not os.path.exists(crop_out):
-            crop_out = os.path.join(crops_out_dir, crop_stem + ".png")
+        crop_out = crop_lookup.get(crop_stem)
 
-        if os.path.exists(crop_out):
+        if crop_out:
             inpainted = cv2.imread(crop_out)
             original_crop = original[min_y:max_y, min_x:max_x]
-            # Feathered blend: smooth transition at edges
-            blended = _feather_blend(original_crop, inpainted, feather_mask)
-            original[min_y:max_y, min_x:max_x] = blended
+            original[min_y:max_y, min_x:max_x] = _feather_blend(original_crop, inpainted, feather_alpha, feather_inv)
 
         cv2.imwrite(os.path.join(output_dir, fname), original)
 
@@ -141,12 +128,11 @@ def fast_remove_streamed(
     os.makedirs(crops_dir)
     os.makedirs(crops_out_dir)
 
-    # Build mask
     mask = _build_mask(crop_w, crop_h, regions, min_x, min_y, dilation)
     mask_path = os.path.join(tmp, "crop_mask.png")
     cv2.imwrite(mask_path, mask)
 
-    feather_mask = _build_feather_mask(crop_w, crop_h, feather_px=8)
+    feather_alpha, feather_inv = _build_feather_masks(crop_w, crop_h, feather_px=8)
 
     # Pass 1: Decode video → crop → save crops only
     print("Pass 1: Extracting watermark crops...")
@@ -155,23 +141,46 @@ def fast_remove_streamed(
 
     # IOPaint on crops
     print("Running IOPaint on cropped regions...")
-    cmd = [
-        "iopaint", "run",
-        "--model", "lama",
-        "--device", device,
-        "--image", crops_dir,
-        "--mask", mask_path,
-        "--output", crops_out_dir,
-    ]
-    subprocess.run(cmd, check=True)
+    _run_iopaint(crops_dir, mask_path, crops_out_dir, device)
+
+    # Pre-build crop path lookup for Pass 2
+    crop_lookup = {}
+    for f in os.listdir(crops_out_dir):
+        stem = os.path.splitext(f)[0]
+        crop_lookup[stem] = os.path.join(crops_out_dir, f)
 
     # Pass 2: Decode video again → paste inpainted crops → encode output
     print("Pass 2: Compositing and encoding...")
     _paste_and_encode(video_path, output_path, fw, fh, fps,
-                      crops_out_dir, min_x, min_y, max_x, max_y, feather_mask)
+                      crop_lookup, min_x, min_y, max_x, max_y,
+                      feather_alpha, feather_inv)
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("Stream inpainting complete.")
+
+
+def _run_iopaint(image_dir: str, mask_path: str, output_dir: str, device: str) -> None:
+    """Run IOPaint with stderr captured."""
+    cmd = [
+        "iopaint", "run",
+        "--model", "lama",
+        "--device", device,
+        "--image", image_dir,
+        "--mask", mask_path,
+        "--output", output_dir,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"IOPaint failed (exit {result.returncode}): {result.stderr[:500]}")
+
+
+def _build_crop_lookup(crops_out_dir: str, frame_files: list[str]) -> dict[str, str]:
+    """Pre-build stem → path mapping for inpainted crops."""
+    lookup = {}
+    for f in os.listdir(crops_out_dir):
+        stem = os.path.splitext(f)[0]
+        lookup[stem] = os.path.join(crops_out_dir, f)
+    return lookup
 
 
 def _extract_crops(
@@ -180,40 +189,58 @@ def _extract_crops(
 ) -> int:
     """Decode video via FFmpeg pipe, crop watermark region, save as JPEG."""
     proc = subprocess.Popen(
-        ["ffmpeg", "-i", video_path, "-f", "rawvideo", "-pix_fmt", "bgr24", "-v", "quiet", "-"],
+        [
+            "ffmpeg",
+            "-threads", "0",
+            "-i", video_path,
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-v", "quiet",
+            "-",
+        ],
         stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
     frame_size = fw * fh * 3
     idx = 0
-    while True:
-        raw = proc.stdout.read(frame_size)
-        if len(raw) < frame_size:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3))
-        crop = frame[min_y:max_y, min_x:max_x].copy()
-        cv2.imwrite(
-            os.path.join(crops_dir, f"frame_{idx:06d}.jpg"),
-            crop, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY],
-        )
-        idx += 1
-        if idx % 1000 == 0:
-            print(f"  Cropped {idx} frames...", flush=True)
-    proc.wait()
+    try:
+        while True:
+            raw = proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3))
+            crop = frame[min_y:max_y, min_x:max_x].copy()
+            cv2.imwrite(
+                os.path.join(crops_dir, f"frame_{idx:06d}.jpg"),
+                crop, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY],
+            )
+            idx += 1
+            if idx % 1000 == 0:
+                print(f"  Cropped {idx} frames...", flush=True)
+    finally:
+        proc.stdout.close()
+        proc.wait()
     return idx
 
 
 def _paste_and_encode(
     video_path: str, output_path: str, fw: int, fh: int, fps: float,
-    crops_out_dir: str, min_x: int, min_y: int, max_x: int, max_y: int,
-    feather_mask: np.ndarray,
+    crop_lookup: dict[str, str],
+    min_x: int, min_y: int, max_x: int, max_y: int,
+    feather_alpha: np.ndarray, feather_inv: np.ndarray,
 ) -> None:
     """Decode video, paste inpainted crops, encode to output."""
-    # Decoder
     decoder = subprocess.Popen(
-        ["ffmpeg", "-i", video_path, "-f", "rawvideo", "-pix_fmt", "bgr24", "-v", "quiet", "-"],
+        [
+            "ffmpeg",
+            "-threads", "0",
+            "-i", video_path,
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-v", "quiet",
+            "-",
+        ],
         stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
-    # Encoder (video only — audio added in a separate mux step)
     tmp_video = output_path + ".tmp_noaudio.mp4"
     encoder = subprocess.Popen(
         [
@@ -221,41 +248,48 @@ def _paste_and_encode(
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{fw}x{fh}", "-r", str(fps),
             "-i", "-",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
             "-v", "quiet",
             tmp_video,
         ],
         stdin=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
 
     frame_size = fw * fh * 3
     idx = 0
-    while True:
-        raw = decoder.stdout.read(frame_size)
-        if len(raw) < frame_size:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3)).copy()
+    try:
+        while True:
+            raw = decoder.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3)).copy()
 
-        crop_path = os.path.join(crops_out_dir, f"frame_{idx:06d}.jpg")
-        if not os.path.exists(crop_path):
-            crop_path = os.path.join(crops_out_dir, f"frame_{idx:06d}.png")
+            stem = f"frame_{idx:06d}"
+            crop_path = crop_lookup.get(stem)
 
-        if os.path.exists(crop_path):
-            inpainted = cv2.imread(crop_path)
-            original_crop = frame[min_y:max_y, min_x:max_x]
-            frame[min_y:max_y, min_x:max_x] = _feather_blend(original_crop, inpainted, feather_mask)
+            if crop_path:
+                inpainted = cv2.imread(crop_path)
+                if inpainted is not None:
+                    original_crop = frame[min_y:max_y, min_x:max_x]
+                    frame[min_y:max_y, min_x:max_x] = _feather_blend(
+                        original_crop, inpainted, feather_alpha, feather_inv
+                    )
 
-        encoder.stdin.write(frame.tobytes())
-        idx += 1
-        if idx % 1000 == 0:
-            print(f"  Encoded {idx} frames...", flush=True)
-
-    decoder.wait()
-    encoder.stdin.close()
-    encoder.wait()
+            encoder.stdin.write(frame.tobytes())
+            idx += 1
+            if idx % 1000 == 0:
+                print(f"  Encoded {idx} frames...", flush=True)
+    finally:
+        decoder.stdout.close()
+        decoder.wait()
+        encoder.stdin.close()
+        encoder.wait()
 
     # Mux: add original audio
-    final = output_path
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -264,11 +298,13 @@ def _paste_and_encode(
             "-map", "0:v", "-map", "1:a?",
             "-c:v", "copy", "-c:a", "copy",
             "-v", "quiet",
-            final,
+            output_path,
         ],
         check=True,
+        stderr=subprocess.DEVNULL,
     )
-    os.remove(tmp_video)
+    if os.path.exists(tmp_video):
+        os.remove(tmp_video)
 
 
 def _build_mask(
@@ -290,24 +326,29 @@ def _build_mask(
     return mask
 
 
-def _build_feather_mask(crop_w: int, crop_h: int, feather_px: int = 8) -> np.ndarray:
-    """Build a feathered alpha mask: 1.0 in center, gradient to 0.0 at edges."""
+def _build_feather_masks(crop_w: int, crop_h: int, feather_px: int = 8) -> tuple[np.ndarray, np.ndarray]:
+    """Build feathered alpha + inverse masks. Pre-expanded for broadcast."""
     mask = np.ones((crop_h, crop_w), dtype=np.float32)
     for i in range(feather_px):
         alpha = (i + 1) / (feather_px + 1)
-        # Top/bottom edges
         if i < crop_h // 2:
-            mask[i, :] = min(mask[i, 0], alpha)
-            mask[crop_h - 1 - i, :] = min(mask[crop_h - 1 - i, 0], alpha)
-        # Left/right edges
+            mask[i, :] = np.minimum(mask[i, :], alpha)
+            mask[crop_h - 1 - i, :] = np.minimum(mask[crop_h - 1 - i, :], alpha)
         if i < crop_w // 2:
             mask[:, i] = np.minimum(mask[:, i], alpha)
             mask[:, crop_w - 1 - i] = np.minimum(mask[:, crop_w - 1 - i], alpha)
-    return mask
+    # Pre-expand to (H, W, 1) and pre-compute inverse — avoids per-frame allocation
+    alpha_3d = mask[:, :, np.newaxis]
+    inv_3d = (1.0 - mask)[:, :, np.newaxis]
+    return alpha_3d, inv_3d
 
 
-def _feather_blend(original: np.ndarray, inpainted: np.ndarray, feather: np.ndarray) -> np.ndarray:
-    """Blend inpainted region into original using feather mask."""
-    alpha = feather[:, :, np.newaxis]  # (H, W, 1)
-    blended = (inpainted.astype(np.float32) * alpha + original.astype(np.float32) * (1 - alpha))
+def _feather_blend(original: np.ndarray, inpainted: np.ndarray,
+                   alpha: np.ndarray, alpha_inv: np.ndarray) -> np.ndarray:
+    """Blend inpainted region using pre-computed alpha/inverse masks.
+
+    Uses uint8 → float32 only where needed, with pre-computed inverse to avoid
+    per-frame (1 - alpha) allocation.
+    """
+    blended = inpainted.astype(np.float32) * alpha + original.astype(np.float32) * alpha_inv
     return blended.astype(np.uint8)

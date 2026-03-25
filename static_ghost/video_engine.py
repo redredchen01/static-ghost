@@ -45,28 +45,35 @@ def probe(video_path: str) -> dict:
 
 
 def extract_sample_frames(video_path: str, n: int, output_dir: str) -> list[str]:
-    """Extract n evenly-spaced frames from video as PNGs."""
+    """Extract n evenly-spaced frames using a single FFmpeg call with select filter."""
     os.makedirs(output_dir, exist_ok=True)
     meta = probe(video_path)
     duration = meta["duration"]
+    fps = meta["fps"]
 
-    paths = []
-    for i in range(n):
-        timestamp = (duration / (n + 1)) * (i + 1)
-        out_path = os.path.join(output_dir, f"sample_{i:04d}.png")
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", str(timestamp),
-                "-i", video_path,
-                "-frames:v", "1",
-                "-q:v", "1",
-                out_path,
-            ],
-            capture_output=True,
-        )
-        if os.path.isfile(out_path):
-            paths.append(out_path)
+    # Build select expression: select frames nearest to each target timestamp
+    timestamps = [(duration / (n + 1)) * (i + 1) for i in range(n)]
+    frame_indices = [int(t * fps) for t in timestamps]
+    select_expr = "+".join(f"eq(n\\,{idx})" for idx in frame_indices)
+
+    pattern = os.path.join(output_dir, "sample_%04d.png")
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vf", f"select='{select_expr}'",
+            "-vsync", "vfr",
+            pattern,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    paths = sorted(
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if f.endswith(".png") and os.path.getsize(os.path.join(output_dir, f)) > 0
+    )
     return paths
 
 
@@ -78,7 +85,6 @@ def extract_all_frames(video_path: str, output_dir: str) -> int:
         [
             "ffmpeg", "-y",
             "-i", video_path,
-            "-q:v", "1",
             pattern,
         ],
         capture_output=True,
@@ -107,6 +113,8 @@ def merge(frames_dir: str, video_path: str, output_path: str) -> str:
         "-map", "0:v",
         "-map", "1:a?",
         "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         output_path,
