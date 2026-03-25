@@ -1,6 +1,6 @@
 [project]
 name = "static-ghost"
-version = "0.4.0"
+version = "0.4.1"
 description = "Remove static watermarks from videos using LaMa inpainting"
 readme = "README.md"
 license = {text = "MIT"}
