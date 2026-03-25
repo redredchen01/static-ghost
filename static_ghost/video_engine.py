@@ -28,7 +28,10 @@ def probe(video_path: str) -> dict:
     audio_stream = next((s for s in streams if s["codec_type"] == "audio"), None)
 
     r_frame_rate = video_stream.get("r_frame_rate", "0/1")
-    fps = float(Fraction(r_frame_rate))
+    try:
+        fps = float(Fraction(r_frame_rate))
+    except ZeroDivisionError:
+        fps = 0.0
 
     duration = float(video_stream.get("duration", 0))
     if duration == 0:
